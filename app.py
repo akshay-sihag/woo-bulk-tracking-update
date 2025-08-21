@@ -5,25 +5,51 @@ import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
 
-st.set_page_config(page_title="Woo Tracking Uploader", layout="wide")
+st.set_page_config(page_title="Woo Bulk Tracking Uploader", layout="wide")
 
-st.title("Bulk FedEx Tracking → WooCommerce Orders")
-st.caption("Uploads tracking via Woo Shipment Tracking, then marks orders Completed if tracking was saved")
+st.title("Bulk FedEx Tracking → WooCommerce")
+st.caption("Adds tracking via Woo Shipment Tracking, then marks orders Completed if tracking was saved.")
 
-# Secrets first, then sidebar overrides
-default_site = st.secrets.get("site", "")
-default_ck = st.secrets.get("ck", "")
-default_cs = st.secrets.get("cs", "")
+# --- Credentials: use secrets, no sidebar, never display values ---
+SITE_SECRET = st.secrets.get("site")
+CK_SECRET   = st.secrets.get("ck")
+CS_SECRET   = st.secrets.get("cs")
 
-with st.sidebar:
-    st.subheader("Connection")
-    site = st.text_input("Store URL", value=default_site or "https://your-store.com", placeholder="https://your-store.com")
-    ck = st.text_input("Consumer Key", value=default_ck, type="password")
-    cs = st.text_input("Consumer Secret", value=default_cs, type="password")
-    st.markdown("Use Secrets for production deployments")
+site = SITE_SECRET
+ck   = CK_SECRET
+cs   = CS_SECRET
 
-st.markdown("Upload payload as CSV or JSON")
-uploaded = st.file_uploader("Choose CSV or JSON", type=["csv", "json", "xlsx"])
+using_secrets = all([site, ck, cs])
+status_col1, status_col2 = st.columns([1, 5])
+with status_col1:
+    st.markdown("### 🔒")
+with status_col2:
+    if using_secrets:
+        st.success("Using stored secrets (not shown).")
+    else:
+        st.warning("Secrets not found. Enter credentials below. They won’t be stored and won’t be displayed.")
+
+# Optional inline form if secrets are missing
+if not using_secrets:
+    with st.form("creds_form", clear_on_submit=False):
+        site = st.text_input("Store URL", value="", placeholder="https://your-store.com")
+        ck   = st.text_input("Consumer Key", value="", type="password", placeholder="ck_xxx")
+        cs   = st.text_input("Consumer Secret", value="", type="password", placeholder="cs_xxx")
+        ok = st.form_submit_button("Use these for this session")
+    if not ok:
+        st.stop()
+
+# If still missing anything, stop safely
+if not site or not ck or not cs:
+    st.error("Credentials are required to proceed.")
+    st.stop()
+
+auth = HTTPBasicAuth(ck, cs)
+
+# --- Upload payload: CSV / JSON / XLSX ---
+st.subheader("Upload payload as CSV or JSON")
+uploaded = st.file_uploader("Choose CSV/JSON/XLSX (max ~200MB)", type=["csv", "json", "xlsx"])
+# (file_uploader ref & limits)  :contentReference[oaicite:1]{index=1}
 
 sample_json = [
     {
@@ -52,12 +78,12 @@ def load_dataframe(file) -> pd.DataFrame:
             return pd.DataFrame()
     return pd.DataFrame()
 
-def validate_df(df: pd.DataFrame) -> tuple[bool, list[str]]:
+def validate_df(df: pd.DataFrame):
     required = ["order_id", "tracking_provider", "tracking_number"]
     missing = [c for c in required if c not in df.columns]
-    return (len(missing) == 0, missing)
+    return len(missing) == 0, missing
 
-def post_tracking(site_url: str, auth: HTTPBasicAuth, row: dict) -> tuple[int, dict]:
+def post_tracking(site_url: str, auth: HTTPBasicAuth, row: dict):
     order_id = int(row["order_id"])
     url = f"{site_url.rstrip('/')}/wp-json/wc-shipment-tracking/v3/orders/{order_id}/shipment-trackings"
     payload = {
@@ -67,7 +93,6 @@ def post_tracking(site_url: str, auth: HTTPBasicAuth, row: dict) -> tuple[int, d
         "status_shipped":   int(row.get("status_shipped", 1)),
         "replace_tracking": int(row.get("replace_tracking", 0))
     }
-    # Remove None keys
     payload = {k: v for k, v in payload.items() if v is not None}
     r = requests.post(url, auth=auth, json=payload, timeout=30)
     try:
@@ -76,7 +101,7 @@ def post_tracking(site_url: str, auth: HTTPBasicAuth, row: dict) -> tuple[int, d
         data = {"text": r.text}
     return r.status_code, data
 
-def complete_order(site_url: str, auth: HTTPBasicAuth, order_id: int) -> tuple[int, dict]:
+def complete_order(site_url: str, auth: HTTPBasicAuth, order_id: int):
     url = f"{site_url.rstrip('/')}/wp-json/wc/v3/orders/{order_id}"
     payload = {"status": "completed"}
     r = requests.put(url, auth=auth, json=payload, timeout=30)
@@ -91,54 +116,54 @@ if uploaded:
     ok, missing = validate_df(df)
     if not ok:
         st.error(f"Missing required columns: {', '.join(missing)}")
-    else:
-        # Fill optional defaults
-        if "status_shipped" not in df.columns:
-            df["status_shipped"] = 1
-        if "replace_tracking" not in df.columns:
-            df["replace_tracking"] = 0
+        st.stop()
 
-        st.subheader("Preview")
-        st.dataframe(df.head(20), use_container_width=True)
+    # Defaults for optional fields
+    if "status_shipped" not in df.columns:
+        df["status_shipped"] = 1
+    if "replace_tracking" not in df.columns:
+        df["replace_tracking"] = 0
 
-        if st.button("Run Bulk Update"):
-            if not site or not ck or not cs:
-                st.error("Please provide Store URL, Consumer Key, and Consumer Secret")
+    st.subheader("Preview")
+    st.dataframe(df.head(20), use_container_width=True)
+
+    run = st.button("Run Bulk Update")
+    if run:
+        results = []
+        prog = st.progress(0)
+        log = st.empty()
+        total = len(df)
+
+        for i, row in enumerate(df.to_dict(orient="records"), start=1):
+            oid = int(row["order_id"])
+
+            # 1) Add tracking
+            t_status, t_data = post_tracking(site, auth, row)
+            success_tracking = t_status in (200, 201)
+
+            # 2) Only complete if tracking succeeded
+            if success_tracking:
+                c_status, c_data = complete_order(site, auth, oid)
+                success_complete = c_status in (200, 201)
             else:
-                auth = HTTPBasicAuth(ck, cs)
-                results = []
-                prog = st.progress(0)
-                log = st.empty()
+                c_status, c_data = None, {"skipped": True}
+                success_complete = False
 
-                total = len(df)
-                for i, row in enumerate(df.to_dict(orient="records"), start=1):
-                    oid = int(row["order_id"])
-                    t_status, t_data = post_tracking(site, auth, row)
-                    success_tracking = t_status in (200, 201)
+            results.append({
+                "order_id": oid,
+                "tracking_status": t_status,
+                "tracking_ok": success_tracking,
+                "complete_status": c_status,
+                "complete_ok": success_complete,
+                "tracking_response": t_data,
+                "complete_response": c_data
+            })
 
-                    if success_tracking:
-                        c_status, c_data = complete_order(site, auth, oid)
-                        success_complete = c_status in (200, 201)
-                    else:
-                        c_status, c_data = None, {"skipped": True}
-                        success_complete = False
+            log.write(f"Order {oid} tracking {t_status} → complete {c_status}")
+            prog.progress(i / total)
 
-                    results.append({
-                        "order_id": oid,
-                        "tracking_status": t_status,
-                        "tracking_ok": success_tracking,
-                        "complete_status": c_status,
-                        "complete_ok": success_complete,
-                        "tracking_response": t_data,
-                        "complete_response": c_data
-                    })
-
-                    log.write(f"Order {oid} tracking {t_status} then complete {c_status}")
-                    prog.progress(i / total)
-
-                st.success("Done")
-                out = pd.DataFrame(results)
-                st.dataframe(out, use_container_width=True)
-
-                csv = out.to_csv(index=False).encode("utf-8")
-                st.download_button("Download results CSV", data=csv, file_name="tracking_results.csv", mime="text/csv")
+        st.success("Done")
+        out = pd.DataFrame(results)
+        st.dataframe(out, use_container_width=True)
+        csv = out.to_csv(index=False).encode("utf-8")
+        st.download_button("Download results CSV", data=csv, file_name="tracking_results.csv", mime="text/csv")
